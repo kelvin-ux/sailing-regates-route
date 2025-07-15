@@ -8,7 +8,6 @@ from dataclasses import dataclass
 
 from app.core.weather import WeatherData
 from app.utils.calculations import calculate_bearing, calculate_distance
-from app.utils.geometry import point_in_polygon
 
 
 @dataclass
@@ -64,13 +63,15 @@ class RouteOptimizer:
             self.graph.add_node(i, pos=(point.x, point.y), point=point)
 
         # Dodaj krawędzie między sąsiadującymi punktami
+        max_connection_distance = 5.0  # Maksymalna odległość połączenia w NM
+        
         for i, point1 in enumerate(grid_points):
             for j, point2 in enumerate(grid_points[i + 1:], i + 1):
-                if self._can_connect(point1, point2, obstacles):
-                    distance = calculate_distance(point1, point2)
-                    travel_time = self._calculate_travel_time(
-                        point1, point2, weather_data
-                    )
+                distance = calculate_distance(point1, point2)
+                
+                # Sprawdź czy punkty są wystarczająco blisko
+                if distance <= max_connection_distance and self._can_connect(point1, point2, obstacles):
+                    travel_time = self._calculate_travel_time(point1, point2, weather_data)
 
                     self.graph.add_edge(i, j,
                                         distance=distance,
@@ -84,8 +85,20 @@ class RouteOptimizer:
         line = LineString([point1, point2])
 
         for obstacle in obstacles:
-            if line.intersects(obstacle.geom):
-                return False
+            try:
+                if hasattr(obstacle, 'geom') and obstacle.geom:
+                    # Konwertuj geometrię z PostGIS
+                    from shapely import wkb
+                    if hasattr(obstacle.geom, 'data'):
+                        geom = wkb.loads(bytes(obstacle.geom.data))
+                    else:
+                        geom = obstacle.geom
+                    
+                    if line.intersects(geom):
+                        return False
+            except Exception:
+                # Jeśli konwersja się nie powiedzie, pomiń przeszkodę
+                continue
 
         return True
 
@@ -118,32 +131,55 @@ class RouteOptimizer:
                            weather_data: WeatherData) -> Tuple[List[Point], float]:
         """Znajduje optymalną trasę używając algorytmu A*"""
 
-        # Buduj graf
-        graph = self.build_graph(grid_points, obstacles, weather_data)
+        # Dodaj punkty startowy i końcowy do siatki jeśli ich tam nie ma
+        extended_grid = list(grid_points)
+        
+        # Sprawdź czy punkty startowy i końcowy są już w siatce
+        start_in_grid = any(
+            calculate_distance(start, point) < 0.1 for point in grid_points
+        )
+        end_in_grid = any(
+            calculate_distance(end, point) < 0.1 for point in grid_points
+        )
+        
+        if not start_in_grid:
+            extended_grid.insert(0, start)
+        if not end_in_grid:
+            extended_grid.append(end)
 
-        # Znajdź najbliższe węzły do punktów start i end
-        start_node = self._find_nearest_node(start, grid_points)
-        end_node = self._find_nearest_node(end, grid_points)
+        # Buduj graf
+        graph = self.build_graph(extended_grid, obstacles, weather_data)
+
+        # Znajdź indeksy punktów start i end
+        start_node = self._find_nearest_node(start, extended_grid)
+        end_node = self._find_nearest_node(end, extended_grid)
 
         # Użyj algorytmu A* do znalezienia optymalnej trasy
         try:
             path_nodes = nx.astar_path(
                 graph, start_node, end_node,
-                heuristic=self._heuristic_function,
+                heuristic=lambda n1, n2: self._heuristic_function(n1, n2, extended_grid),
                 weight='time'
             )
 
             # Konwertuj węzły na punkty
-            route_points = [grid_points[node] for node in path_nodes]
+            route_points = [extended_grid[node] for node in path_nodes]
 
             # Oblicz całkowity czas podróży
-            total_time = sum(graph[path_nodes[i]][path_nodes[i + 1]]['time']
-                             for i in range(len(path_nodes) - 1))
+            total_time = 0.0
+            if len(path_nodes) > 1:
+                for i in range(len(path_nodes) - 1):
+                    if graph.has_edge(path_nodes[i], path_nodes[i + 1]):
+                        total_time += graph[path_nodes[i]][path_nodes[i + 1]]['time']
 
             return route_points, total_time
 
         except nx.NetworkXNoPath:
-            return [], float('inf')
+            # Jeśli nie ma ścieżki, zwróć prostą linię
+            return [start, end], self._calculate_travel_time(start, end, weather_data)
+        except Exception as e:
+            print(f"Błąd w znajdowaniu trasy: {e}")
+            return [start, end], self._calculate_travel_time(start, end, weather_data)
 
     def _find_nearest_node(self, point: Point, grid_points: List[Point]) -> int:
         """Znajduje najbliższy węzeł do danego punktu"""
@@ -158,23 +194,31 @@ class RouteOptimizer:
 
         return nearest_node
 
-    def _heuristic_function(self, node1: int, node2: int) -> float:
+    def _heuristic_function(self, node1: int, node2: int, grid_points: List[Point]) -> float:
         """Funkcja heurystyczna dla algorytmu A*"""
-        point1 = self.graph.nodes[node1]['point']
-        point2 = self.graph.nodes[node2]['point']
+        point1 = grid_points[node1]
+        point2 = grid_points[node2]
 
-        # Użyj prostej odległości euklidesowej jako heurystyki
-        return calculate_distance(point1, point2) / 6.0  # Założona średnia prędkość
+        # Użyj prostej odległości jako heurystyki podzielonej przez średnią prędkość
+        distance = calculate_distance(point1, point2)
+        return distance / 6.0  # Założona średnia prędkość 6 węzłów
 
 
 # Domyślna charakterystyka polarna dla jachtu regatowego
 DEFAULT_POLAR = SailingPolar([
-    PolarSpeed(0, 0),  # Martwy wiatr
-    PolarSpeed(30, 2.0),  # Ostry kurs
-    PolarSpeed(45, 4.0),  # Ostry kurs
-    PolarSpeed(60, 5.5),  # Półwiatr
-    PolarSpeed(90, 6.0),  # Kurs boczny
+    PolarSpeed(0, 0),      # Martwy wiatr
+    PolarSpeed(30, 2.0),   # Ostry kurs
+    PolarSpeed(45, 4.0),   # Ostry kurs
+    PolarSpeed(60, 5.5),   # Półwiatr
+    PolarSpeed(90, 6.0),   # Kurs boczny
     PolarSpeed(120, 5.8),  # Fordewind
     PolarSpeed(150, 5.0),  # Kurs zawietrzny
     PolarSpeed(180, 4.5),  # Pełny zawietrzny
 ])
+
+
+def create_simple_route(start: Point, end: Point, weather_data: WeatherData) -> Tuple[List[Point], float]:
+    """Tworzy prostą trasę między dwoma punktami (fallback)"""
+    optimizer = RouteOptimizer(DEFAULT_POLAR)
+    travel_time = optimizer._calculate_travel_time(start, end, weather_data)
+    return [start, end], travel_time

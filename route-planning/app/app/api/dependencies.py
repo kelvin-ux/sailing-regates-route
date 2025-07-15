@@ -31,8 +31,15 @@ async def get_weather_crud(db: AsyncSession = Depends(get_db)) -> WeatherCRUD:
 
 async def get_weather_service() -> WeatherService:
     """Dependency do pobrania serwisu pogody"""
-    async with WeatherService() as service:
-        return service
+    # Utwórz instancję serwisu pogody
+    service = WeatherService()
+    try:
+        # Jeśli używamy context managera
+        async with service:
+            yield service
+    except Exception:
+        # Fallback - zwróć serwis bez context managera
+        yield service
 
 
 async def get_route_service(
@@ -75,29 +82,91 @@ def validate_coordinates(lat: float, lon: float):
     if not (-90 <= lat <= 90):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nieprawidłowa szerokość geograficzna"
+            detail=f"Nieprawidłowa szerokość geograficzna: {lat}. Musi być między -90 a 90."
         )
     if not (-180 <= lon <= 180):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nieprawidłowa długość geograficzna"
+            detail=f"Nieprawidłowa długość geograficzna: {lon}. Musi być między -180 a 180."
         )
 
 
 def validate_gdansk_bay_bounds(north: float, south: float, east: float, west: float):
     """Waliduje czy współrzędne są w obszarze Zatoki Gdańskiej"""
-    from app.core.config import settings
+    try:
+        from app.core.config import settings
+        bounds = settings.GDANSK_BAY_BOUNDS
+    except ImportError:
+        # Fallback bounds dla Zatoki Gdańskiej
+        bounds = {
+            'north': 54.8,
+            'south': 54.3,
+            'east': 19.0,
+            'west': 18.3
+        }
 
-    bounds = settings.GDANSK_BAY_BOUNDS
+    # Waliduj logikę współrzędnych
+    if south >= north:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Południowa granica musi być mniejsza od północnej"
+        )
+    
+    if west >= east:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Zachodnia granica musi być mniejsza od wschodniej"
+        )
 
+    # Sprawdź czy współrzędne są w dozwolonym obszarze
     if not (bounds['south'] <= south <= north <= bounds['north']):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Współrzędne muszą być w obszarze Zatoki Gdańskiej"
+            detail=f"Współrzędne szerokości geograficznej muszą być w obszarze Zatoki Gdańskiej "
+                   f"({bounds['south']} - {bounds['north']})"
         )
 
     if not (bounds['west'] <= west <= east <= bounds['east']):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Współrzędne muszą być w obszarze Zatoki Gdańskiej"
+            detail=f"Współrzędne długości geograficznej muszą być w obszarze Zatoki Gdańskiej "
+                   f"({bounds['west']} - {bounds['east']})"
         )
+
+
+def validate_bounds_size(north: float, south: float, east: float, west: float, 
+                        max_area_deg: float = 1.0):
+    """Waliduje czy obszar nie jest zbyt duży"""
+    lat_range = north - south
+    lon_range = east - west
+    
+    if lat_range > max_area_deg or lon_range > max_area_deg:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Obszar jest zbyt duży. Maksymalna różnica współrzędnych: {max_area_deg} stopni"
+        )
+
+
+def validate_route_request_bounds(start_lat: float, start_lon: float, 
+                                 end_lat: float, end_lon: float):
+    """Waliduje bounds dla żądania obliczenia trasy"""
+    # Waliduj współrzędne startowe i końcowe
+    validate_coordinates(start_lat, start_lon)
+    validate_coordinates(end_lat, end_lon)
+    
+    # Oblicz bounds z marginesem
+    margin = 0.1  # 0.1 stopnia marginesu
+    north = max(start_lat, end_lat) + margin
+    south = min(start_lat, end_lat) - margin
+    east = max(start_lon, end_lon) + margin
+    west = min(start_lon, end_lon) - margin
+    
+    # Waliduj czy bounds są w dozwolonym obszarze
+    validate_gdansk_bay_bounds(north, south, east, west)
+    
+    return {
+        'north': north,
+        'south': south,
+        'east': east,
+        'west': west
+    }

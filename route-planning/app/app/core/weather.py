@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import json
 from shapely.geometry import Point
 import logging
+import numpy as np
 
 from app.core.config import settings
 
@@ -18,7 +19,7 @@ class WindData:
     speed: float  # m/s
     direction: float  # stopnie (0-360)
     gust: Optional[float] = None  # m/s
-    timestamp: datetime = None
+    timestamp: Optional[datetime] = None
 
 
 @dataclass
@@ -67,8 +68,21 @@ class WeatherData:
     def _calculate_distance(self, lat1: float, lon1: float,
                             lat2: float, lon2: float) -> float:
         """Oblicza odległość między dwoma punktami"""
-        from geopy.distance import geodesic
-        return geodesic((lat1, lon1), (lat2, lon2)).kilometers
+        try:
+            from geopy.distance import geodesic
+            return geodesic((lat1, lon1), (lat2, lon2)).kilometers
+        except ImportError:
+            # Fallback - uproszczona formuła haversine
+            R = 6371.0  # promień Ziemi w km
+            lat1_rad = np.radians(lat1)
+            lat2_rad = np.radians(lat2)
+            dlat = np.radians(lat2 - lat1)
+            dlon = np.radians(lon2 - lon1)
+            
+            a = (np.sin(dlat / 2) ** 2 +
+                 np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2) ** 2)
+            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            return R * c
 
 
 class WeatherService:
@@ -92,17 +106,34 @@ class WeatherService:
         """Pobiera dane pogodowe dla określonego obszaru"""
         weather_data = WeatherData()
 
+        # Sprawdź czy mamy klucz API
+        if not self.api_key:
+            logger.warning("Brak klucza API OpenWeather. Używam domyślnych danych pogodowych.")
+            return self._create_default_weather_data(bounds)
+
         try:
             # Pobierz dane dla kilku punktów w obszarze
             grid_points = self._create_weather_grid(bounds)
 
-            tasks = []
-            for lat, lon in grid_points:
-                task = self._fetch_weather_point(lat, lon)
-                tasks.append(task)
+            # Jeśli nie ma sesji, stwórz tymczasową
+            if not self.session:
+                async with aiohttp.ClientSession() as session:
+                    self.session = session
+                    tasks = []
+                    for lat, lon in grid_points:
+                        task = self._fetch_weather_point(lat, lon)
+                        tasks.append(task)
 
-            # Wykonaj wszystkie zapytania równolegle
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                    # Wykonaj wszystkie zapytania równolegle z timeoutem
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                tasks = []
+                for lat, lon in grid_points:
+                    task = self._fetch_weather_point(lat, lon)
+                    tasks.append(task)
+
+                # Wykonaj wszystkie zapytania równolegle
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Przetwórz wyniki
             for result in results:
@@ -110,6 +141,11 @@ class WeatherService:
                     weather_data.add_weather_point(result)
                 elif isinstance(result, Exception):
                     logger.error(f"Błąd pobierania danych pogodowych: {result}")
+
+            # Jeśli nie udało się pobrać żadnych danych, użyj domyślnych
+            if not weather_data.weather_points:
+                logger.warning("Nie udało się pobrać danych pogodowych. Używam domyślnych.")
+                return self._create_default_weather_data(bounds)
 
         except Exception as e:
             logger.error(f"Błąd pobierania danych pogodowych: {e}")
@@ -123,14 +159,19 @@ class WeatherService:
         grid_points = []
 
         # Utwórz siatkę 3x3 punktów
-        lat_step = (bounds['north'] - bounds['south']) / 2
-        lon_step = (bounds['east'] - bounds['west']) / 2
+        try:
+            lat_step = (bounds['north'] - bounds['south']) / 2
+            lon_step = (bounds['east'] - bounds['west']) / 2
 
-        for i in range(3):
-            for j in range(3):
-                lat = bounds['south'] + i * lat_step
-                lon = bounds['west'] + j * lon_step
-                grid_points.append((lat, lon))
+            for i in range(3):
+                for j in range(3):
+                    lat = bounds['south'] + i * lat_step
+                    lon = bounds['west'] + j * lon_step
+                    grid_points.append((lat, lon))
+        except KeyError as e:
+            logger.error(f"Brak wymaganego klucza w bounds: {e}")
+            # Fallback - środek Zatoki Gdańskiej
+            grid_points = [(54.52, 18.55)]
 
         return grid_points
 
@@ -147,58 +188,114 @@ class WeatherService:
             'units': 'metric'
         }
 
-        async with self.session.get(url, params=params) as response:
-            if response.status == 200:
-                data = await response.json()
-                return self._parse_weather_data(data, lat, lon)
-            else:
-                raise Exception(f"API error: {response.status}")
+        try:
+            async with self.session.get(url, params=params, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return self._parse_weather_data(data, lat, lon)
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"API error {response.status}: {error_text}")
+        except asyncio.TimeoutError:
+            raise Exception("Timeout podczas pobierania danych pogodowych")
+        except Exception as e:
+            raise Exception(f"Błąd pobierania danych: {str(e)}")
 
     def _parse_weather_data(self, data: Dict, lat: float, lon: float) -> WeatherPoint:
         """Parsuje dane pogodowe z API"""
-        wind_data = data.get('wind', {})
-        main_data = data.get('main', {})
+        try:
+            wind_data = data.get('wind', {})
+            main_data = data.get('main', {})
 
-        wind = WindData(
-            speed=wind_data.get('speed', 5.0),
-            direction=wind_data.get('deg', 270.0),
-            gust=wind_data.get('gust'),
-            timestamp=datetime.utcnow()
-        )
+            wind = WindData(
+                speed=wind_data.get('speed', 5.0),
+                direction=wind_data.get('deg', 270.0),
+                gust=wind_data.get('gust'),
+                timestamp=datetime.utcnow()
+            )
 
-        return WeatherPoint(
-            lat=lat,
-            lon=lon,
-            wind=wind,
-            temperature=main_data.get('temp'),
-            pressure=main_data.get('pressure'),
-            humidity=main_data.get('humidity')
-        )
+            return WeatherPoint(
+                lat=lat,
+                lon=lon,
+                wind=wind,
+                temperature=main_data.get('temp'),
+                pressure=main_data.get('pressure'),
+                humidity=main_data.get('humidity')
+            )
+        except Exception as e:
+            logger.error(f"Błąd parsowania danych pogodowych: {e}")
+            # Zwróć domyślne dane dla tego punktu
+            return WeatherPoint(
+                lat=lat,
+                lon=lon,
+                wind=WindData(speed=5.0, direction=270.0, timestamp=datetime.utcnow()),
+                temperature=15.0,
+                pressure=1013.25,
+                humidity=60.0
+            )
 
     def _create_default_weather_data(self, bounds: Dict[str, float]) -> WeatherData:
         """Tworzy domyślne dane pogodowe"""
         weather_data = WeatherData()
 
-        # Dodaj jeden punkt w centrum obszaru
-        center_lat = (bounds['north'] + bounds['south']) / 2
-        center_lon = (bounds['east'] + bounds['west']) / 2
+        try:
+            # Dodaj kilka punktów w obszarze z domyślnymi danymi
+            center_lat = (bounds['north'] + bounds['south']) / 2
+            center_lon = (bounds['east'] + bounds['west']) / 2
 
-        default_wind = WindData(
-            speed=5.0,  # 5 m/s
-            direction=270.0,  # Zachód
-            timestamp=datetime.utcnow()
-        )
+            # Stwórz siatkę 3x3 z domyślnymi danymi
+            lat_step = (bounds['north'] - bounds['south']) / 2
+            lon_step = (bounds['east'] - bounds['west']) / 2
 
-        weather_point = WeatherPoint(
-            lat=center_lat,
-            lon=center_lon,
-            wind=default_wind,
-            temperature=15.0,
-            pressure=1013.25,
-            humidity=60.0
-        )
+            for i in range(3):
+                for j in range(3):
+                    lat = bounds['south'] + i * lat_step
+                    lon = bounds['west'] + j * lon_step
 
-        weather_data.add_weather_point(weather_point)
+                    # Dodaj lekką wariację w danych wiatru
+                    wind_speed = 5.0 + (i + j) * 0.5  # 5.0-7.0 m/s
+                    wind_direction = 270.0 + (i - j) * 10  # 250-290 stopni
+
+                    default_wind = WindData(
+                        speed=wind_speed,
+                        direction=wind_direction % 360,
+                        timestamp=datetime.utcnow()
+                    )
+
+                    weather_point = WeatherPoint(
+                        lat=lat,
+                        lon=lon,
+                        wind=default_wind,
+                        temperature=15.0,
+                        pressure=1013.25,
+                        humidity=60.0
+                    )
+
+                    weather_data.add_weather_point(weather_point)
+
+        except Exception as e:
+            logger.error(f"Błąd tworzenia domyślnych danych pogodowych: {e}")
+            # Fallback - jeden punkt w centrum
+            center_lat = 54.52
+            center_lon = 18.55
+
+            default_wind = WindData(
+                speed=5.0,
+                direction=270.0,
+                timestamp=datetime.utcnow()
+            )
+
+            weather_point = WeatherPoint(
+                lat=center_lat,
+                lon=center_lon,
+                wind=default_wind,
+                temperature=15.0,
+                pressure=1013.25,
+                humidity=60.0
+            )
+
+            weather_data.add_weather_point(weather_point)
+
         return weather_data
 
 
@@ -212,6 +309,7 @@ class GRIBWeatherService:
         """Ładuje dane pogodowe z pliku GRIB"""
         try:
             import pygrib
+            import numpy as np
 
             weather_data = WeatherData()
 

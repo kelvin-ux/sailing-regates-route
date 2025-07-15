@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks, Response
+from fastapi.responses import Response as FastAPIResponse
 from typing import List, Optional
 from uuid import UUID
 import asyncio
@@ -123,8 +124,6 @@ async def delete_route(
 
 
 @router.get("/routes/{route_id}/gpx",
-            response_class=Response,
-            media_type="application/gpx+xml",
             summary="Eksportuj trasę do GPX",
             description="Eksportuje trasę do formatu GPX")
 async def export_route_to_gpx(
@@ -138,12 +137,13 @@ async def export_route_to_gpx(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Trasa nie została znaleziona"
         )
-
-    from fastapi.responses import Response
-    return Response(
+    
+    return FastAPIResponse(
         content=gpx_content,
         media_type="application/gpx+xml",
-        headers={"Content-Disposition": f"attachment; filename=route_{route_id}.gpx"}
+        headers={
+            "Content-Disposition": f"attachment; filename=route_{route_id}.gpx"
+        }
     )
 
 
@@ -167,12 +167,35 @@ async def get_obstacles(
     result = []
     for obstacle in obstacles:
         # Konwertuj geometrię z PostGIS na listę punktów
-        # To wymaga implementacji konwersji WKT/WKB na punkty
+        # Tutaj należy zaimplementować właściwą konwersję geometrii
+        geometry_points = []
+        if hasattr(obstacle, 'geom') and obstacle.geom:
+            # Przykładowa konwersja - wymaga dopracowania
+            try:
+                from shapely import wkb
+                from shapely.geometry import shape
+                import json
+                
+                # Konwertuj geometrię WKB na Shapely
+                geom = wkb.loads(bytes(obstacle.geom.data))
+                
+                # Konwertuj na punkty
+                if geom.geom_type == 'Polygon':
+                    coords = list(geom.exterior.coords)
+                elif geom.geom_type == 'Point':
+                    coords = [(geom.x, geom.y)]
+                else:
+                    coords = list(geom.coords)
+                
+                geometry_points = [{"lat": coord[1], "lon": coord[0]} for coord in coords]
+            except Exception:
+                geometry_points = []
+        
         result.append(ObstacleSchema(
             id=obstacle.id,
             name=obstacle.name,
             type=obstacle.type,
-            geometry=[],  # Tutaj należy zaimplementować konwersję geometrii
+            geometry=geometry_points,
             min_depth=obstacle.min_depth,
             description=obstacle.description
         ))
@@ -192,7 +215,12 @@ async def get_boat_profiles(
 
     result = []
     for profile in profiles:
-        import json
+        try:
+            import json
+            polar_data = json.loads(profile.polar_data) if isinstance(profile.polar_data, str) else profile.polar_data
+        except (json.JSONDecodeError, TypeError):
+            polar_data = {}
+            
         result.append(BoatProfileSchema(
             id=profile.id,
             name=profile.name,
@@ -200,7 +228,7 @@ async def get_boat_profiles(
             length_m=profile.length_m,
             beam_m=profile.beam_m,
             draft_m=profile.draft_m,
-            polar_data=json.loads(profile.polar_data),
+            polar_data=polar_data,
             max_wind_speed_ms=profile.max_wind_speed_ms,
             min_depth_m=profile.min_depth_m
         ))

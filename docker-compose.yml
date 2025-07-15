@@ -1,46 +1,60 @@
-version: '3.8'
-
 services:
   db:
-    image: postgis/postgis:15-3.4
+    platform: linux/amd64
+    image: postgres:15
     environment:
       POSTGRES_DB: sailing_routes
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
-      POSTGRES_HOST_AUTH_METHOD: trust
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sailing_routes"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    # Wymuszenie słuchania na wszystkich interfejsach
+    command: >
+      postgres
+      -c listen_addresses='*'
+      -c max_connections=200
 
   redis:
+    platform: linux/amd64
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --bind 0.0.0.0
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   backend:
+    platform: linux/amd64
     build:
       context: ./route-planning/app
       dockerfile: Dockerfile
     environment:
+      # Używamy IP zamiast nazw hostów
       - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/sailing_routes
       - REDIS_URL=redis://redis:6379
-      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-demo_key}
       - DEBUG=True
+      - HOST=0.0.0.0
+      - PORT=8000
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
     ports:
       - "8000:8000"
     depends_on:
@@ -53,36 +67,38 @@ services:
       - ./static:/app/static
     working_dir: /app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   frontend:
+    platform: linux/amd64
     build:
       context: ./route-planning/frontend
       dockerfile: Dockerfile
     environment:
       - REACT_APP_API_URL=http://localhost:8000/api/v1
+      - VITE_API_URL=http://localhost:8000/api/v1
+      - CHOKIDAR_USEPOLLING=true
+      - WATCHPACK_POLLING=true
     ports:
       - "3000:3000"
+      - "5173:5173"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     volumes:
       - ./route-planning/frontend:/app
-      - /app/node_modules
+      - frontend_node_modules:/app/node_modules
     working_dir: /app
     command: npm start
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
-    depends_on:
-      - backend
-      - frontend
     restart: unless-stopped
 
 volumes:
   postgres_data:
   redis_data:
+  frontend_node_modules:
